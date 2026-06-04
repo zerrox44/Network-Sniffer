@@ -347,7 +347,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if not args.iface:
-        print("need --iface, or use --menu / --list")
+        print("need --iface or use --menu / --list")
         ap.print_help()
         sys.exit(1)
 
