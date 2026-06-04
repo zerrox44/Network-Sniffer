@@ -2,421 +2,341 @@ import argparse
 import sys
 import time
 from collections import Counter
-from typing import Optional
 
 try:
     from scapy.all import (
-        ARP,
-        DNS,
-        DNSRR,
-        ICMP,
-        IP,
-        IPv6,
-        Raw,
-        TCP,
-        UDP,
-        conf,
-        get_if_list,
-        sniff,
-        wrpcap,
+        ARP, DNS, DNSRR, ICMP, IP, IPv6,
+        Raw, TCP, UDP, conf,
+        get_if_list, sniff, wrpcap,
     )
 except ImportError:
-    print("Error: scapy is not installed. Run 'python -m pip install scapy'.")
+    print("do pip install scapy")
     sys.exit(1)
 
 conf.use_pcap = True
 
 
-def list_interfaces() -> None:
-    print("Available network interfaces:")
-    for idx, iface in enumerate(get_if_list(), 1):
-        print(f"{idx}. {iface}")
+_ARP_OPS = {1: "who-has", 2: "is-at"}
 
 
-def build_filter(user_filter: str, only_ip: Optional[str], protocols: Optional[str]) -> Optional[str]:
+def list_interfaces():
+    print("Interfaces:")
+    for i, iface in enumerate(get_if_list(), 1):
+        print(f"  {i}. {iface}")
+
+
+def build_filter(user_filter, only_ip, protocols):
     parts = []
+
     if only_ip:
         parts.append(f"host {only_ip}")
 
     if protocols:
-        names = [name.strip().lower() for name in protocols.split(",") if name.strip()]
-        allowed = {"tcp", "udp", "icmp", "arp", "ip", "ipv6"}
-        invalid = [name for name in names if name not in allowed]
-        if invalid:
-            raise ValueError(f"Unsupported protocols: {', '.join(invalid)}")
+        names = [p.strip().lower() for p in protocols.split(",") if p.strip()]
+        ok = {"tcp", "udp", "icmp", "arp", "ip", "ipv6"}
+        bad = [n for n in names if n not in ok]
+        if bad:
+            raise ValueError(f"Unknown protocols: {', '.join(bad)}")
         parts.append(" or ".join(names))
 
     if user_filter:
         parts.append(user_filter)
 
-    return " and ".join(f"({part})" for part in parts) if parts else None
+    if not parts:
+        return None
+    return " and ".join(f"({p})" for p in parts)
 
 
-def http_summary(packet) -> Optional[str]:
-    if not packet.haslayer(Raw) or not packet.haslayer(TCP):
+def http_summary(packet):
+    if not (packet.haslayer(Raw) and packet.haslayer(TCP)):
         return None
 
-    payload = bytes(packet[Raw].load)
-    if not payload:
+    try:
+        text = bytes(packet[Raw].load).decode("utf-8", errors="ignore")
+    except Exception:
         return None
 
-    text = payload.decode("utf-8", errors="ignore")
-    first_line = text.splitlines()[0] if text else ""
-    methods = ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "HTTP/")
-    for method in methods:
-        if first_line.startswith(method):
-            return first_line
+    first = text.splitlines()[0] if text else ""
+    for m in ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "HTTP/"):
+        if first.startswith(m):
+            return first
     return None
 
 
-def dns_summary(packet) -> Optional[str]:
+def dns_summary(packet):
     if not packet.haslayer(DNS):
         return None
 
-    dns = packet[DNS]
-    if dns.qr == 0 and dns.qd:
-        name = dns.qd.qname.decode("utf-8", errors="ignore")
-        return f"DNS query {name} type={dns.qd.qtype}"
+    d = packet[DNS]
+    if d.qr == 0 and d.qd:
+        name = d.qd.qname.decode("utf-8", errors="ignore")
+        return f"DNS query {name} type={d.qd.qtype}"
 
     answers = []
-    answer = dns.an
-    while isinstance(answer, DNSRR) and len(answers) < 4:
-        name = getattr(answer, "rrname", b"").decode("utf-8", errors="ignore")
-        rdata = answer.rdata
-        if isinstance(rdata, bytes):
-            rdata = rdata.decode("utf-8", errors="ignore")
-        answers.append(f"{name} -> {rdata}")
-        answer = answer.payload
+    a = d.an
+    while isinstance(a, DNSRR) and len(answers) < 4:
+        n = getattr(a, "rrname", b"").decode("utf-8", errors="ignore")
+        rd = a.rdata
+        if isinstance(rd, bytes):
+            rd = rd.decode("utf-8", errors="ignore")
+        answers.append(f"{n} -> {rd}")
+        a = a.payload
 
     return f"DNS response answers={len(answers)}"
 
 
-def arp_summary(packet) -> Optional[str]:
+def arp_summary(packet):
     if not packet.haslayer(ARP):
         return None
+    a = packet[ARP]
+    op = _ARP_OPS.get(a.op, str(a.op))
+    return f"ARP {op} {a.psrc} -> {a.pdst}"
 
-    arp = packet[ARP]
-    op = {1: "who-has", 2: "is-at"}.get(arp.op, str(arp.op))
-    return f"ARP {op} {arp.psrc} -> {arp.pdst}"
 
-
-def icmp_summary(packet) -> Optional[str]:
+def icmp_summary(packet):
     if not packet.haslayer(ICMP):
         return None
-
-    icmp = packet[ICMP]
-    return f"ICMP type={icmp.type} code={icmp.code}"
+    ic = packet[ICMP]
+    return f"ICMP type={ic.type} code={ic.code}"
 
 
 def packet_info(packet):
-    src = "unknown"
-    dst = "unknown"
+    src = dst = "unknown"
     proto = "OTHER"
     ports = ""
     details = []
 
     if packet.haslayer(IP):
-        ip_layer = packet[IP]
-        src = ip_layer.src
-        dst = ip_layer.dst
-        proto = {1: "ICMP", 6: "TCP", 17: "UDP"}.get(ip_layer.proto, "IP")
+        l = packet[IP]
+        src, dst = l.src, l.dst
+        proto = {1: "ICMP", 6: "TCP", 17: "UDP"}.get(l.proto, "IP")
     elif packet.haslayer(IPv6):
-        ip_layer = packet[IPv6]
-        src = ip_layer.src
-        dst = ip_layer.dst
+        l = packet[IPv6]
+        src, dst = l.src, l.dst
         proto = "IPv6"
     elif packet.haslayer(ARP):
-        arp_layer = packet[ARP]
-        src = arp_layer.psrc
-        dst = arp_layer.pdst
+        l = packet[ARP]
+        src, dst = l.psrc, l.pdst
         proto = "ARP"
 
     if packet.haslayer(TCP):
-        tcp_layer = packet[TCP]
-        ports = f"{tcp_layer.sport}->{tcp_layer.dport}"
+        t = packet[TCP]
+        ports = f"{t.sport}->{t.dport}"
     elif packet.haslayer(UDP):
-        udp_layer = packet[UDP]
-        ports = f"{udp_layer.sport}->{udp_layer.dport}"
+        u = packet[UDP]
+        ports = f"{u.sport}->{u.dport}"
 
-    http_text = http_summary(packet)
-    dns_text = dns_summary(packet)
-    arp_text = arp_summary(packet)
-    icmp_text = icmp_summary(packet)
+    http_t  = http_summary(packet)
+    dns_t   = dns_summary(packet)
+    arp_t   = arp_summary(packet)
+    icmp_t  = icmp_summary(packet)
 
-    if http_text:
-        details.append(http_text)
+    if http_t:
+        details.append(http_t)
         proto = "HTTP"
-    if dns_text:
-        details.append(dns_text)
+    if dns_t:
+        details.append(dns_t)
         proto = "DNS"
-    if arp_text:
-        details.append(arp_text)
-    if icmp_text:
-        details.append(icmp_text)
+    if arp_t:
+        details.append(arp_t)
+    if icmp_t:
+        details.append(icmp_t)
 
-    if packet.haslayer(Raw) and not (http_text or dns_text):
-        raw_payload = bytes(packet[Raw].load)
-        if raw_payload:
-            preview = raw_payload[:80].decode("utf-8", errors="ignore").replace("\n", " ").replace("\r", " ")
+    if packet.haslayer(Raw) and not (http_t or dns_t):
+        raw = bytes(packet[Raw].load)
+        if raw:
+            preview = raw[:80].decode("utf-8", errors="ignore").replace("\n", " ").replace("\r", " ")
             details.append(preview)
 
-    summary = f"{src} -> {dst} | {proto}"
+    line = f"{src} -> {dst} | {proto}"
     if ports:
-        summary += f" | ports={ports}"
+        line += f" | ports={ports}"
     if details:
-        summary += " | " + " | ".join(details)
+        line += " | " + " | ".join(details)
 
-    arp_op = packet[ARP].op if packet.haslayer(ARP) else None
+    arp_op   = packet[ARP].op if packet.haslayer(ARP) else None
     icmp_key = (packet[ICMP].type, packet[ICMP].code) if packet.haslayer(ICMP) else None
 
-    return summary, proto, src, dst, ports, arp_op, icmp_key
+    return line, proto, src, dst, ports, arp_op, icmp_key
 
 
-def print_live_stats(
-    protocol_counts: Counter,
-    ip_counts: Counter,
-    port_counts: Counter,
-    arp_counts: Counter,
-    icmp_counts: Counter,
-    dns_count: int,
-    http_count: int,
-    top_talkers: int,
-) -> None:
-    print("\n=== LIVE TRAFFIC STATS ===")
-    if protocol_counts:
+def print_live_stats(pcounts, ipcounts, portcounts, arpcounts, icmpcounts,
+                     dns_n, http_n, top_n):
+    print("\n=== LIVE STATS ===")
+    if pcounts:
         print("Protocols:")
-        for proto, count in protocol_counts.most_common(6):
-            print(f"  {proto}: {count}")
-    if arp_counts:
-        print("ARP ops:")
-        for op, count in arp_counts.most_common():
-            name = {1: "who-has", 2: "is-at"}.get(op, str(op))
-            print(f"  {name}: {count}")
-    if icmp_counts:
-        print("ICMP types:")
-        for (icmp_type, code), count in icmp_counts.most_common(6):
-            print(f"  type={icmp_type} code={code}: {count}")
-    if dns_count:
-        print(f"DNS packets: {dns_count}")
-    if http_count:
-        print(f"HTTP packets: {http_count}")
-    if ip_counts and top_talkers > 0:
-        print("Top IP talkers:")
-        for ip, count in ip_counts.most_common(top_talkers):
-            print(f"  {ip}: {count}")
-    if port_counts and top_talkers > 0:
-        print("Top port pairs:")
-        for port, count in port_counts.most_common(top_talkers):
-            print(f"  {port}: {count}")
-    print("==========================\n")
+        for p, c in pcounts.most_common(6):
+            print(f"  {p}: {c}")
+    if arpcounts:
+        print("ARP:")
+        for op, c in arpcounts.most_common():
+            print(f"  {_ARP_OPS.get(op, op)}: {c}")
+    if icmpcounts:
+        print("ICMP:")
+        for (t, code), c in icmpcounts.most_common(6):
+            print(f"  type={t} code={code}: {c}")
+    if dns_n:
+        print(f"DNS: {dns_n}")
+    if http_n:
+        print(f"HTTP: {http_n}")
+    if ipcounts and top_n > 0:
+        print("Top IPs:")
+        for ip, c in ipcounts.most_common(top_n):
+            print(f"  {ip}: {c}")
+    if portcounts and top_n > 0:
+        print("Top ports:")
+        for port, c in portcounts.most_common(top_n):
+            print(f"  {port}: {c}")
+    print("==================\n")
 
 
-def capture_packets(
-    interface: str,
-    packet_filter: str,
-    count: int,
-    timeout: int,
-    output: Optional[str],
-    only_ip: Optional[str],
-    protocols: Optional[str],
-    show_summary: bool,
-    show_details: bool,
-    quiet: bool,
-    top_talkers: int,
-    live_stats: bool,
-    stats_interval: int,
-) -> None:
+def capture_packets(interface, packet_filter, count, timeout, output,
+                    only_ip, protocols, show_summary, show_details,
+                    quiet, top_talkers, live_stats, stats_interval):
+
     full_filter = build_filter(packet_filter, only_ip, protocols)
-    print(f"Starting capture on interface: {interface}")
-    if full_filter:
-        print(f"Using filter: {full_filter}")
-    if count > 0:
-        print(f"Capturing up to {count} packets")
-    elif timeout > 0:
-        print(f"Capturing for up to {timeout} seconds")
-    else:
-        print("Capturing until interrupted (Ctrl+C)")
-    if output:
-        print(f"Output file: {output}")
-    if live_stats:
-        print(f"Live stats every {stats_interval} seconds")
 
-    protocol_counts: Counter[str] = Counter()
-    ip_counts: Counter[str] = Counter()
-    port_counts: Counter[str] = Counter()
-    arp_counts: Counter[int] = Counter()
-    icmp_counts: Counter[tuple[int, int]] = Counter()
-    dns_count = 0
-    http_count = 0
-    packets = []
+    print(f"Capturing on: {interface}")
+    if full_filter:
+        print(f"Filter: {full_filter}")
+
+    if count > 0:
+        print(f"Stopping at {count} packets")
+    elif timeout > 0:
+        print(f"Stopping after {timeout}s")
+    else:
+        print("Ctrl+C to stop")
+
+    if output:
+        print(f"Saving to: {output}")
+
+    pcounts   = Counter()
+    ipcounts  = Counter()
+    portcounts = Counter()
+    arpcounts = Counter()
+    icmpcounts = Counter()
+    dns_n = 0
+    http_n = 0
+    captured = []
     next_stats = time.time() + stats_interval if live_stats else 0
 
-    def on_packet(packet) -> None:
-        nonlocal next_stats, dns_count, http_count
-        summary, proto, src, dst, ports, arp_op, icmp_key = packet_info(packet)
-        protocol_counts[proto] += 1
-        if src:
-            ip_counts[src] += 1
-        if dst:
-            ip_counts[dst] += 1
-        if ports:
-            port_counts[ports] += 1
-        if arp_op is not None:
-            arp_counts[arp_op] += 1
-        if icmp_key is not None:
-            icmp_counts[icmp_key] += 1
-        if packet.haslayer(DNS):
-            dns_count += 1
-        if "HTTP" in proto:
-            http_count += 1
+    def handle(packet):
+        nonlocal next_stats, dns_n, http_n
+
+        line, proto, src, dst, ports, arp_op, icmp_key = packet_info(packet)
+
+        pcounts[proto] += 1
+        if src: ipcounts[src] += 1
+        if dst: ipcounts[dst] += 1
+        if ports: portcounts[ports] += 1
+        if arp_op is not None: arpcounts[arp_op] += 1
+        if icmp_key is not None: icmpcounts[icmp_key] += 1
+        if packet.haslayer(DNS): dns_n += 1
+        if "HTTP" in proto: http_n += 1
 
         if not quiet:
-            print(summary if show_details else packet.summary())
+            print(line if show_details else packet.summary())
 
         if live_stats and time.time() >= next_stats:
-            print_live_stats(
-                protocol_counts,
-                ip_counts,
-                port_counts,
-                arp_counts,
-                icmp_counts,
-                dns_count,
-                http_count,
-                top_talkers,
-            )
+            print_live_stats(pcounts, ipcounts, portcounts, arpcounts,
+                             icmpcounts, dns_n, http_n, top_talkers)
             next_stats = time.time() + stats_interval
 
-        packets.append(packet)
+        captured.append(packet)
 
     try:
         sniff(
             iface=interface,
             filter=full_filter,
-            prn=on_packet,
-            count=count if count else 0,
-            timeout=timeout if timeout else None,
+            prn=handle,
+            count=count or 0,
+            timeout=timeout or None,
             store=False,
             promisc=True,
         )
     except KeyboardInterrupt:
-        print("\nCapture stopped by user.")
-    except Exception as exc:
-        print(f"Capture failed: {exc}")
+        print("\nStopped.")
+    except Exception as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
     if output:
-        wrpcap(output, packets)
-        print(f"Saved {len(packets)} packets to {output}")
+        wrpcap(output, captured)
+        print(f"Saved {len(captured)} packets -> {output}")
 
     if show_summary:
-        print("\nCapture summary:")
-        print(f"Total packets: {len(packets)}")
-        if protocol_counts:
-            print("Protocol counts:")
-            for proto, count in protocol_counts.most_common():
-                print(f"  {proto}: {count}")
-        if arp_counts:
-            print("ARP breakdown:")
-            for op, count in arp_counts.most_common():
-                name = {1: "who-has", 2: "is-at"}.get(op, str(op))
-                print(f"  {name}: {count}")
-        if icmp_counts:
-            print("ICMP breakdown:")
-            for (icmp_type, code), count in icmp_counts.most_common():
-                print(f"  type={icmp_type} code={code}: {count}")
-        if dns_count:
-            print(f"DNS packets: {dns_count}")
-        if http_count:
-            print(f"HTTP packets: {http_count}")
-        if top_talkers > 0 and ip_counts:
-            print(f"Top {top_talkers} IPs:")
-            for ip, count in ip_counts.most_common(top_talkers):
-                print(f"  {ip}: {count}")
-        if top_talkers > 0 and port_counts:
-            print(f"Top {top_talkers} ports:")
-            for port, count in port_counts.most_common(top_talkers):
-                print(f"  {port}: {count}")
+        print(f"\nTotal: {len(captured)}")
+        for p, c in pcounts.most_common():
+            print(f"  {p}: {c}")
+        for op, c in arpcounts.most_common():
+            print(f"  ARP {_ARP_OPS.get(op, op)}: {c}")
+        for (t, code), c in icmpcounts.most_common():
+            print(f"  ICMP type={t} code={code}: {c}")
+        if dns_n: print(f"  DNS: {dns_n}")
+        if http_n: print(f"  HTTP: {http_n}")
+        if top_talkers > 0:
+            for ip, c in ipcounts.most_common(top_talkers):
+                print(f"  {ip}: {c}")
+            for port, c in portcounts.most_common(top_talkers):
+                print(f"  {port}: {c}")
 
 
-def cli_menu() -> None:
+def cli_menu():
     print("\nICL Sniffer")
     print("1) List interfaces")
-    print("2) Capture packets")
-    print("3) Capture with filters")
+    print("2) Capture")
+    print("3) Capture w/ filters")
     print("4) Exit")
 
     while True:
-        choice = input("Select [1-4]: ").strip()
-        if choice == "1":
+        c = input("Choice [1-4]: ").strip()
+
+        if c == "1":
             list_interfaces()
-        elif choice == "2":
-            iface = input("Interface name: ").strip()
-            count = int(input("Packet count (0 = unlimited): ").strip() or "0")
-            capture_packets(
-                interface=iface,
-                packet_filter="",
-                count=count,
-                timeout=0,
-                output=None,
-                only_ip=None,
-                protocols=None,
-                show_summary=True,
-                show_details=False,
-                quiet=False,
-                top_talkers=5,
-                live_stats=False,
-                stats_interval=5,
-            )
-        elif choice == "3":
+
+        elif c == "2":
             iface = input("Interface: ").strip()
-            bpf = input("BPF filter: ").strip()
-            only_ip = input("Only IP (blank for none): ").strip() or None
-            protocols = input("Protocols (tcp,udp,icmp,arp,ip,ipv6): ").strip() or None
-            count = int(input("Count (0 = unlimited): ").strip() or "0")
-            timeout = int(input("Timeout seconds: ").strip() or "0")
-            detail = input("Show details? [y/N]: ").strip().lower() == "y"
-            live = input("Live stats? [y/N]: ").strip().lower() == "y"
-            capture_packets(
-                interface=iface,
-                packet_filter=bpf,
-                count=count,
-                timeout=timeout,
-                output=None,
-                only_ip=only_ip,
-                protocols=protocols,
-                show_summary=True,
-                show_details=detail,
-                quiet=False,
-                top_talkers=5,
-                live_stats=live,
-                stats_interval=5,
-            )
-        elif choice == "4":
-            print("Bye.")
+            n = int(input("Count (0=unlimited): ").strip() or 0)
+            capture_packets(iface, "", n, 0, None, None, None,
+                            True, False, False, 5, False, 5)
+
+        elif c == "3":
+            iface    = input("Interface: ").strip()
+            bpf      = input("BPF filter: ").strip()
+            only_ip  = input("Only IP (blank=skip): ").strip() or None
+            protos   = input("Protocols (tcp,udp,...): ").strip() or None
+            n        = int(input("Count (0=unlimited): ").strip() or 0)
+            t        = int(input("Timeout (s): ").strip() or 0)
+            detail   = input("Details? [y/N]: ").strip().lower() == "y"
+            live     = input("Live stats? [y/N]: ").strip().lower() == "y"
+            capture_packets(iface, bpf, n, t, None, only_ip, protos,
+                            True, detail, False, 5, live, 5)
+
+        elif c == "4":
+            print("bye")
             break
         else:
-            print("Invalid choice.")
+            print("?")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Windows network sniffer")
-    parser.add_argument("--iface", help="Interface name to capture on")
-    parser.add_argument("--filter", default="", help="BPF expression, e.g. 'tcp port 80'")
-    parser.add_argument("--count", type=int, default=0, help="Packets to capture")
-    parser.add_argument("--timeout", type=int, default=0, help="Capture time in seconds")
-    parser.add_argument("--output", help="Save capture to pcap file")
-    parser.add_argument("--only-ip", help="Filter packets to/from IP")
-    parser.add_argument("--protocols", help="Comma-separated protocols: tcp,udp,icmp,arp,ip,ipv6")
-    parser.add_argument("--detail", action="store_true", help="Show packet details")
-    parser.add_argument("--quiet", action="store_true", help="Do not print packet lines")
-    parser.add_argument("--top-talkers", type=int, default=5, help="Show top IPs/ports")
-    parser.add_argument("--no-summary", action="store_true", help="Skip summary at the end")
-    parser.add_argument("--live", action="store_true", help="Show live stats")
-    parser.add_argument("--stats-interval", type=int, default=5, help="Live stats interval")
-    parser.add_argument("--menu", action="store_true", help="Interactive mode")
-    parser.add_argument("--list", action="store_true", help="List interfaces")
-
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="net sniffer")
+    ap.add_argument("--iface")
+    ap.add_argument("--filter", default="")
+    ap.add_argument("--count", type=int, default=0)
+    ap.add_argument("--timeout", type=int, default=0)
+    ap.add_argument("--output")
+    ap.add_argument("--only-ip")
+    ap.add_argument("--protocols")
+    ap.add_argument("--detail", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--top-talkers", type=int, default=5)
+    ap.add_argument("--no-summary", action="store_true")
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--stats-interval", type=int, default=5)
+    ap.add_argument("--menu", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    args = ap.parse_args()
 
     if args.menu:
         cli_menu()
@@ -427,26 +347,17 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if not args.iface:
-        print("Specify --iface or use --menu or --list.")
-        parser.print_help()
+        print("need --iface, or use --menu / --list")
+        ap.print_help()
         sys.exit(1)
 
     try:
         capture_packets(
-            interface=args.iface,
-            packet_filter=args.filter,
-            count=args.count,
-            timeout=args.timeout,
-            output=args.output,
-            only_ip=args.only_ip,
-            protocols=args.protocols,
-            show_summary=not args.no_summary,
-            show_details=args.detail,
-            quiet=args.quiet,
-            top_talkers=args.top_talkers,
-            live_stats=args.live,
-            stats_interval=args.stats_interval,
+            args.iface, args.filter, args.count, args.timeout,
+            args.output, args.only_ip, args.protocols,
+            not args.no_summary, args.detail, args.quiet,
+            args.top_talkers, args.live, args.stats_interval,
         )
-    except ValueError as exc:
-        print(f"Invalid argument: {exc}")
+    except ValueError as e:
+        print(f"bad arg: {e}")
         sys.exit(1)
